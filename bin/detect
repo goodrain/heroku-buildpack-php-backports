@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+if [[ -f "$1/composer.json" || -n $(find $1 -maxdepth 2 -name "index.php")  ]]; then
+	echo "PHP" && exit 0
+else
+	exit 1
+fi
