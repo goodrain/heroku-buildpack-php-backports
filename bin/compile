@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+sleep ${PAUSE:-0}
 # bin/compile <build-dir> <cache-dir> <env-dir>
 
 install_ext () {
@@ -21,11 +22,15 @@ install_ext () {
             fi
         else
             echo "- ${ext} (${reason}; bundled)" | indent
-            cp "${ext_ini}" "${BUILD_DIR}/.heroku/php/etc/php/conf.d"
+            if [ "$ext" == "zend-opcache" ] && [ ! -f ${BUILD_DIR}/.heroku/php/etc/php/conf.d/010-ext-zend_opcache.ini ];then
+                cp "${ext_ini}" "${BUILD_DIR}/.heroku/php/etc/php/conf.d"
+            fi
         fi
 
         # 判断php版本并对扩展配置做修改(目前只有php 5.5之前版本的opcache需要修改)
-        if [ `echo $PHP_VERSION | awk  -F . '{print $2}'` -lt 5 ] && [ $ext == "zend-opcache" ];then
+        mainVer=$(echo $PHP_VERSION | awk  -F . '{print $1}')
+        midVer=$(echo $PHP_VERSION | awk  -F . '{print $2}')
+        if [ "$mainVer" -lt 7 -a "$midVer" -lt 5 ] && [ $ext == "zend-opcache" ];then
            sed -i "s#${ext_so}#${ext_dir}/${ext_so}#g" \
            ${BUILD_DIR}/.heroku/php/etc/php/conf.d/ext-${ext}.ini
         fi
@@ -424,37 +429,39 @@ Next, edit your project's '.gitignore' file and add the folder
 For more info, refer to the Composer FAQ: http://bit.ly/1rlCSZU"
 fi
 
-# handle custom oauth keys
-COMPOSER_GITHUB_OAUTH_TOKEN=${COMPOSER_GITHUB_OAUTH_TOKEN:-}
-if [[ -n "$COMPOSER_GITHUB_OAUTH_TOKEN" ]]; then
-    if curl --fail --silent --connect-timeout 3 --max-time 10  --retry 5 --retry-delay 0 --retry-max-time 20 -H "Authorization: token $COMPOSER_GITHUB_OAUTH_TOKEN" https://api.github.com/rate_limit > /dev/null; then
-        composer config -g github-oauth.github.com "$COMPOSER_GITHUB_OAUTH_TOKEN" &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
-        notice_inline 'Using $COMPOSER_GITHUB_OAUTH_TOKEN for GitHub OAuth.'
+if [ "$TYPE" == "online" ];then
+    # handle custom oauth keys
+    COMPOSER_GITHUB_OAUTH_TOKEN=${COMPOSER_GITHUB_OAUTH_TOKEN:-}
+    if [[ -n "$COMPOSER_GITHUB_OAUTH_TOKEN" ]]; then
+        if curl --fail --silent --connect-timeout 3 --max-time 10  --retry 5 --retry-delay 0 --retry-max-time 20 -H "Authorization: token $COMPOSER_GITHUB_OAUTH_TOKEN" https://api.github.com/rate_limit > /dev/null; then
+            composer config -g github-oauth.github.com "$COMPOSER_GITHUB_OAUTH_TOKEN" &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
+            notice_inline 'Using $COMPOSER_GITHUB_OAUTH_TOKEN for GitHub OAuth.'
+        else
+            error 'Invalid $COMPOSER_GITHUB_OAUTH_TOKEN for GitHub OAuth!'
+        fi
     else
-        error 'Invalid $COMPOSER_GITHUB_OAUTH_TOKEN for GitHub OAuth!'
+        # don't forget to remove any stored key if it's gone from the env
+        composer config -g --unset github-oauth.github.com &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
+        if curl --silent --connect-timeout 3 --max-time 10  --retry 5 --retry-delay 0 --retry-max-time 20 https://api.github.com/rate_limit | python -c 'import sys, json; sys.exit((json.load(sys.stdin)["resources"]["core"]["remaining"] > 0))'; then # yes, check > 0, not < 1 - exit status of 0 will trigger the if
+            notice "You've reached the GitHub API's request rate limit.
+    Composer will try and fall back to slower downloads from source.
+    It's strongly recommended you use a custom OAuth token; see
+    http://devcenter.heroku.com/articles/php-support#custom-github-oauth-tokens"
+        fi
     fi
-else
-    # don't forget to remove any stored key if it's gone from the env
-    composer config -g --unset github-oauth.github.com &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
-    if curl --silent --connect-timeout 3 --max-time 10  --retry 5 --retry-delay 0 --retry-max-time 20 https://api.github.com/rate_limit | python -c 'import sys, json; sys.exit((json.load(sys.stdin)["resources"]["core"]["remaining"] > 0))'; then # yes, check > 0, not < 1 - exit status of 0 will trigger the if
-        notice "You've reached the GitHub API's request rate limit.
-Composer will try and fall back to slower downloads from source.
-It's strongly recommended you use a custom OAuth token; see
-http://devcenter.heroku.com/articles/php-support#custom-github-oauth-tokens"
+    # no need for the token to stay around in the env
+    unset COMPOSER_GITHUB_OAUTH_TOKEN
+
+    # install dependencies unless composer.json is completely empty (in which case it'd talk to packagist.org which may be slow and is unnecessary)
+    cat "$COMPOSER" | python -c 'import sys,json; sys.exit(not json.load(sys.stdin));' && composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction 2>&1 | indent
+
+    composer show --installed heroku/heroku-buildpack-php &> /dev/null && error "Your '$COMPOSER' requires 'heroku/heroku-buildpack-php'.
+    This package may only be used as a dependency in 'require-dev'!"
+
+    if cat "$COMPOSER" | python -c 'import sys,json; sys.exit("compile" not in json.load(sys.stdin).get("scripts", {}));'; then
+        status "Running 'composer compile'..."
+        composer run-script --no-dev --no-interaction compile 2>&1 | indent
     fi
-fi
-# no need for the token to stay around in the env
-unset COMPOSER_GITHUB_OAUTH_TOKEN
-
-# install dependencies unless composer.json is completely empty (in which case it'd talk to packagist.org which may be slow and is unnecessary)
-cat "$COMPOSER" | python -c 'import sys,json; sys.exit(not json.load(sys.stdin));' && composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction 2>&1 | indent
-
-composer show --installed heroku/heroku-buildpack-php &> /dev/null && error "Your '$COMPOSER' requires 'heroku/heroku-buildpack-php'.
-This package may only be used as a dependency in 'require-dev'!"
-
-if cat "$COMPOSER" | python -c 'import sys,json; sys.exit("compile" not in json.load(sys.stdin).get("scripts", {}));'; then
-    status "Running 'composer compile'..."
-    composer run-script --no-dev --no-interaction compile 2>&1 | indent
 fi
 
 status "Preparing runtime environment..."
